@@ -3758,6 +3758,7 @@
 
             // إفراغ المحتوى المدفوع المحمّل من الذاكرة والصفحة عند الخروج
             Object.keys(axisBank).forEach(k => delete axisBank[k]);
+            Object.keys(questionCache).forEach(k => delete questionCache[k]);
             const courseContainer = document.getElementById('course-axis-container');
             if (courseContainer) courseContainer.innerHTML = '';
 
@@ -3815,12 +3816,12 @@
 
         // يجلب كل صفوف جدول معيّن من Supabase صفحة تلو الأخرى (Supabase يحدّ الاستعلام الواحد
         // بـ 1000 صف كحد أقصى افتراضياً)، لضمان تحميل جميع الأسئلة/الدروس دون أي نقصان
-        async function fetchAllRows(tableName, orderFn) {
+        async function fetchAllRows(tableName, selectCols, orderFn) {
             const PAGE_SIZE = 1000;
             let allRows = [];
             let from = 0;
             while (true) {
-                let query = supabaseClient.from(tableName).select('*');
+                let query = supabaseClient.from(tableName).select(selectCols || '*');
                 if (orderFn) query = orderFn(query);
                 const { data, error } = await query.range(from, from + PAGE_SIZE - 1);
                 if (error) return { data: null, error };
@@ -3831,8 +3832,25 @@
             return { data: allRows, error: null };
         }
 
+        // ذاكرة تخزين مؤقت للأسئلة التي تم تحميلها فعلاً بكامل بياناتها (السؤال، الخيارات، الجواب، الشرح)
+        // بعد أن فتحها المستخدم — لا يتم تحميل أي سؤال بكامله إلا لحظة عرضه فعلياً
+        const questionCache = {};
+
+        // يجلب البيانات الكاملة لسؤال واحد بمعرّفه (id) من Supabase، ويخزّنها مؤقتاً
+        // حتى لا يُعاد تحميلها إن رجع المستخدم إليها (زر "السابق" مثلاً)
+        async function fetchQuestionById(id) {
+            if (questionCache[id]) return { data: questionCache[id], error: null };
+            const { data, error } = await supabaseClient.from('se_questions').select('*').eq('id', id).single();
+            if (error) return { data: null, error };
+            questionCache[id] = data;
+            return { data, error: null };
+        }
+
         async function loadPaidContent() {
-            const { data: qRows, error: qErr } = await fetchAllRows('se_questions');
+            // لا يتم هنا تحميل نصوص الأسئلة ولا الخيارات ولا الأجوبة — فقط المعرّف والمحور
+            // والمستوى، الضروريين لبناء قوائم المحاور والمستويات. كل سؤال بكامل تفاصيله
+            // (بما فيها الجواب الصحيح) لا يُجلب من الخادم إلا عند فتحه فعلياً من طرف المستخدم.
+            const { data: qRows, error: qErr } = await fetchAllRows('se_questions', 'id, axis, level');
             if (qErr) {
                 console.error("Questions load error:", qErr.message);
                 return { ok: false, error: qErr.message };
@@ -3842,19 +3860,13 @@
                 const axis = row.axis;
                 if (!axisBank[axis]) axisBank[axis] = [];
                 axisBank[axis].push({
-                    q: row.q,
-                    options: row.options,
-                    answer: row.answer,
+                    id: row.id,
                     axis: row.axis,
-                    fine_theme: row.fine_theme,
-                    difficulty: row.difficulty,
-                    explanation: row.explanation,
-                    source: row.source,
                     level: row.level
                 });
             });
 
-            const { data: lRows, error: lErr } = await fetchAllRows('se_lessons', q =>
+            const { data: lRows, error: lErr } = await fetchAllRows('se_lessons', '*', q =>
                 q.order('axis', { ascending: true }).order('order_index', { ascending: true })
             );
             if (lErr) {
@@ -4176,11 +4188,45 @@
 
             updateCourseLinkButton();
             updateScoreUI();
-            loadQuestion(currentIndex);
+            await loadQuestion(currentIndex);
         }
 
-        function loadQuestion(index) {
-            const data = currentQuestions[index];
+        // رقم تسلسلي يزداد مع كل طلب تحميل سؤال، لتفادي عرض سؤال قديم إن تغيّر
+        // الفهرس الحالي (بالنقر السريع مثلاً) أثناء انتظار وصول سؤال سابق من الخادم
+        let questionLoadToken = 0;
+
+        async function loadQuestion(index) {
+            const ref = currentQuestions[index];
+
+            // مسار احتياطي: إن كان السؤال يتضمّن بياناته الكاملة مباشرة (الوضع القديم
+            // questionBank غير المرتبط بالمحاور)، يُعرض كما هو دون أي طلب من الخادم
+            let data;
+            if (ref && ref.q !== undefined) {
+                data = ref;
+            } else {
+                const myToken = ++questionLoadToken;
+
+                // حالة تحميل مؤقتة ريثما تصل بيانات السؤال كاملة من الخادم
+                document.getElementById('q-number').innerText = `السؤال ${index + 1} / ${currentQuestions.length}`;
+                document.getElementById('q-text').innerText = 'جارٍ التحميل...';
+                document.getElementById('options-container').innerHTML = '';
+                hideExplanation();
+                document.getElementById('btn-prev').classList.add('disabled');
+                document.getElementById('btn-next').classList.add('disabled');
+
+                const res = await fetchQuestionById(ref.id);
+
+                // إن تم فتح سؤال آخر في هذه الأثناء (نقر سريع)، تجاهل هذه النتيجة المتأخرة
+                if (myToken !== questionLoadToken) return;
+
+                document.getElementById('btn-next').classList.remove('disabled');
+                if (res.error || !res.data) {
+                    document.getElementById('q-text').innerText = 'تعذّر تحميل هذا السؤال. حاول مجدداً.';
+                    console.error('Question load error:', res.error && res.error.message);
+                    return;
+                }
+                data = res.data;
+            }
 
             document.getElementById('q-number').innerText = `السؤال ${index + 1} / ${currentQuestions.length}`;
             document.getElementById('q-text').innerText = data.q;
@@ -4249,19 +4295,30 @@
                 if (correctIndex !== -1 && items[correctIndex]) items[correctIndex].classList.add('correct');
             }
 
-            showExplanation(currentQuestions[currentIndex]);
+            const curRef = currentQuestions[currentIndex];
+            showExplanation(curRef && curRef.q !== undefined ? curRef : questionCache[curRef.id]);
             updateScoreUI();
+        }
+
+        // يعطي الجواب الصحيح للسؤال المطلوب، سواء كان متوفراً مباشرة (الوضع القديم)
+        // أو عبر الذاكرة المؤقتة للأسئلة التي تم تحميلها فعلياً من الخادم
+        function getCachedAnswer(idx) {
+            const ref = currentQuestions[idx];
+            if (!ref) return undefined;
+            if (ref.q !== undefined) return ref.answer;
+            const cached = questionCache[ref.id];
+            return cached ? cached.answer : undefined;
         }
 
         function updateScoreUI() {
             let correctCount = 0;
             Object.keys(userAnswers).forEach(idx => {
-                if (userAnswers[idx] === currentQuestions[idx].answer) correctCount++;
+                if (userAnswers[idx] === getCachedAnswer(idx)) correctCount++;
             });
             document.getElementById('score-val').innerText = correctCount;
         }
 
-        function changeQuestion(direction) {
+        async function changeQuestion(direction) {
             const newIndex = currentIndex + direction;
             if (newIndex >= currentQuestions.length) {
                 showResults();
@@ -4269,7 +4326,7 @@
             }
             if (newIndex >= 0 && newIndex < currentQuestions.length) {
                 currentIndex = newIndex;
-                loadQuestion(currentIndex);
+                await loadQuestion(currentIndex);
             }
         }
 
@@ -4279,7 +4336,7 @@
 
             let correctCount = 0;
             Object.keys(userAnswers).forEach(idx => {
-                if (userAnswers[idx] === currentQuestions[idx].answer) correctCount++;
+                if (userAnswers[idx] === getCachedAnswer(idx)) correctCount++;
             });
 
             const total = currentQuestions.length;

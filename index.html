@@ -3813,8 +3813,26 @@
             return d.innerHTML;
         }
 
+        // يجلب كل صفوف جدول معيّن من Supabase صفحة تلو الأخرى (Supabase يحدّ الاستعلام الواحد
+        // بـ 1000 صف كحد أقصى افتراضياً)، لضمان تحميل جميع الأسئلة/الدروس دون أي نقصان
+        async function fetchAllRows(tableName, orderFn) {
+            const PAGE_SIZE = 1000;
+            let allRows = [];
+            let from = 0;
+            while (true) {
+                let query = supabaseClient.from(tableName).select('*');
+                if (orderFn) query = orderFn(query);
+                const { data, error } = await query.range(from, from + PAGE_SIZE - 1);
+                if (error) return { data: null, error };
+                allRows = allRows.concat(data);
+                if (data.length < PAGE_SIZE) break;
+                from += PAGE_SIZE;
+            }
+            return { data: allRows, error: null };
+        }
+
         async function loadPaidContent() {
-            const { data: qRows, error: qErr } = await supabaseClient.from('se_questions').select('*');
+            const { data: qRows, error: qErr } = await fetchAllRows('se_questions');
             if (qErr) {
                 console.error("Questions load error:", qErr.message);
                 return { ok: false, error: qErr.message };
@@ -3836,11 +3854,9 @@
                 });
             });
 
-            const { data: lRows, error: lErr } = await supabaseClient
-                .from('se_lessons')
-                .select('*')
-                .order('axis', { ascending: true })
-                .order('order_index', { ascending: true });
+            const { data: lRows, error: lErr } = await fetchAllRows('se_lessons', q =>
+                q.order('axis', { ascending: true }).order('order_index', { ascending: true })
+            );
             if (lErr) {
                 console.error("Lessons load error:", lErr.message);
                 return { ok: false, error: lErr.message };

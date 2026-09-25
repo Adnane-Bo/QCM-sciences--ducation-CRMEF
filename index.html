@@ -3814,7 +3814,7 @@
         }
 
         async function loadPaidContent() {
-            const { data: qRows, error: qErr } = await supabaseClient.from('questions').select('*');
+            const { data: qRows, error: qErr } = await supabaseClient.from('se_questions').select('*');
             if (qErr) {
                 console.error("Questions load error:", qErr.message);
                 return { ok: false, error: qErr.message };
@@ -3837,7 +3837,7 @@
             });
 
             const { data: lRows, error: lErr } = await supabaseClient
-                .from('lessons')
+                .from('se_lessons')
                 .select('*')
                 .order('axis', { ascending: true })
                 .order('order_index', { ascending: true });
